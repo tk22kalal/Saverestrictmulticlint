@@ -285,7 +285,11 @@ async def _bulk(event):
 
 # ── Batch runner ──────────────────────────────────────────────────────────────
 
-async def _run_batch(acc, client, sender, chat_ref, start_msg: int, end_msg: int):
+async def _run_batch(acc, client, sender, chat_ref, start_msg: int, end_msg: int,
+                     batches_dict=None):
+    # Use caller-supplied dict (for extra bots) or the module-level one (main bot)
+    _bdict = batches_dict if batches_dict is not None else active_batches
+
     total    = end_msg - start_msg + 1
     saved    = 0
     skipped  = 0
@@ -300,7 +304,7 @@ async def _run_batch(acc, client, sender, chat_ref, start_msg: int, end_msg: int
     for msg_id in range(start_msg, end_msg + 1):
 
         # Check for cancellation
-        if active_batches.get(sender):
+        if _bdict.get(sender):
             await client.send_message(sender, "✅ Batch cancelled.")
             return
 
