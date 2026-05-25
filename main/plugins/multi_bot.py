@@ -2,9 +2,11 @@
 multi_bot.py — registers all standard handlers on each extra bot
 (BOT_TOKEN2 / BOT_TOKEN3 / BOT_TOKEN4).
 
-All extra bots share the same `userbot` (Pyrogram user session) so only
-one login is ever needed.  Parallel /batch jobs are possible because each
-bot is an independent Telegram connection.
+Key design:
+- Every extra bot has its OWN active_batches dict (fully isolated).
+  Bot2's /cancel only cancels Bot2's batch; Bot1 is unaffected.
+- All extra bots share the same userbot session — login once, works everywhere.
+- Parallel /batch jobs are possible: each bot is an independent Telegram connection.
 """
 
 import asyncio
@@ -18,13 +20,12 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 from .. import extra_clients, userbot, API_ID, API_HASH
-from main.plugins.batch import _parse_link, _run_batch, active_batches, temp_log_file
+from main.plugins.batch import _parse_link, _run_batch, temp_log_file
 from main.plugins.helpers import get_link, join
 from main.plugins.pyroplug import ggn_new, user_chat_ids
 
 logger = logging.getLogger(__name__)
 
-# ── Constants shared with other plugins ──────────────────────────────────────
 _COMMANDS = [
     '/dl', '/batch', '/cancel', '/login', '/logout', '/mysession',
     '/start', '/help', '/logs', '/setchat', '/remthumb', '/ivalid',
@@ -39,25 +40,22 @@ _START_TEXT = (
 _REPO_URL = "https://github.com/devgaganin"
 _HELP_TEXT = """Here are the available commands:
 
-➡️ /batch - to process multiple links at once by taking start link, iterating though multiple message ids.
+➡️ /batch - Bulk process up to 10K message range.
 
-➡️ /setchat - Forward messages directly to a groupID, channelID (with -100), or user (they must have started the bot) bot must be admin in channel or group.
+➡️ /setchat - Forward messages to a group/channel/user.
+```Use: /setchat <chatID>```
 
-```Use: /setchat channelID```
+➡️ /remthumb - Delete your custom thumbnail.
 
-➡️ /remthumb - Delete your thumbnail.
+➡️ /cancel - Cancel your running batch on this bot.
 
-➡️ /cancel - Cancel ongoing batch process.
+➡️ /dl - Download from YouTube, LinkedIn, etc.
 
-➡️ /dl - Download videos directly from Youtube, Linkedin, etc.
+Note: Send a photo (no command) to set a custom thumbnail.
 
-Note: To set your custom thumbnail just send a photo without any command.
-
-[GitHub Repository](%s)
+[GitHub](%s)
 """ % _REPO_URL
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_user_session(user_id):
     path = "user_sessions.json"
@@ -78,20 +76,25 @@ def _is_range_link(link: str) -> bool:
     return False
 
 
-# ── Handler factory ───────────────────────────────────────────────────────────
-
 def _register(tel_bot, pyro_bot, bot_index: int):
-    """Bind all standard command/message handlers to one extra bot pair."""
+    """Bind all handlers to one extra (tel_bot, pyro_bot) pair.
+
+    Each call creates a fresh _batches dict that is private to this bot.
+    No cross-bot interference possible.
+    """
+
+    # ── THIS BOT'S OWN batch-tracking dict ────────────────────────────────────
+    _batches = {}   # uid → False (running) | True (cancel requested)
 
     # /cancel ─────────────────────────────────────────────────────────────────
     @tel_bot.on(events.NewMessage(incoming=True, pattern='/cancel'))
     async def _cancel(event):
         uid = event.sender_id
-        if active_batches.get(uid) is False:
-            active_batches[uid] = True
+        if _batches.get(uid) is False:
+            _batches[uid] = True
             await event.respond("✅ Batch cancelled.")
         else:
-            await event.respond("There is no running batch to cancel.")
+            await event.respond("No running batch to cancel on this bot.")
 
     # /logs ───────────────────────────────────────────────────────────────────
     @tel_bot.on(events.NewMessage(incoming=True, pattern='/logs'))
@@ -154,9 +157,10 @@ def _register(tel_bot, pyro_bot, bot_index: int):
     async def _bulk(event):
         uid = event.sender_id
 
-        if active_batches.get(uid) is False:
+        # Only check THIS bot's dict — no cross-bot blocking
+        if _batches.get(uid) is False:
             return await event.reply(
-                "A batch is already running. Use /cancel to stop it first."
+                "A batch is already running on this bot. Use /cancel to stop it."
             )
 
         chat_ref = None
@@ -199,12 +203,10 @@ def _register(tel_bot, pyro_bot, bot_index: int):
                     await conv.send_message("End ID must be ≥ start ID.")
                     return
                 if total > 10000:
-                    await conv.send_message(
-                        "Max range is 10 000 messages per batch."
-                    )
+                    await conv.send_message("Max range is 10 000 messages per batch.")
                     return
 
-                active_batches[uid] = False
+                _batches[uid] = False   # mark running in THIS bot's dict
                 await conv.send_message(
                     f"🚀 **Batch starting** (Bot #{bot_index})\n"
                     f"Chat: `{chat_ref}`\n"
@@ -220,7 +222,7 @@ def _register(tel_bot, pyro_bot, bot_index: int):
                 await event.respond(f"Error: {e}")
                 return
 
-        # Resolve user account (shared userbot first, then per-user session)
+        # Resolve user account (shared userbot → per-user /login session)
         acc = userbot
         personal_acc = None
 
@@ -244,25 +246,27 @@ def _register(tel_bot, pyro_bot, bot_index: int):
                     personal_acc = None
 
         if acc is None and isinstance(chat_ref, int):
-            active_batches.pop(uid, None)
+            _batches.pop(uid, None)
             return await pyro_bot.send_message(
                 uid,
                 "❌ **No user session available.**\n\n"
                 "A Telegram user account is required to access private/restricted channels.\n"
-                "👉 Use /login to authenticate on the **main bot**, then try /batch again.",
+                "👉 Use /login on the **main bot** to authenticate, then try /batch again.",
             )
 
         try:
-            await _run_batch(acc, pyro_bot, uid, chat_ref, start_msg, end_msg)
+            # Pass THIS bot's _batches so cancellation is isolated per bot
+            await _run_batch(acc, pyro_bot, uid, chat_ref, start_msg, end_msg,
+                             batches_dict=_batches)
         finally:
             if personal_acc:
                 try:
                     await personal_acc.stop()
                 except Exception:
                     pass
-            active_batches.pop(uid, None)
+            _batches.pop(uid, None)
 
-    # Single-link clone (any private message that looks like a Telegram link) ─
+    # Single-link clone ───────────────────────────────────────────────────────
     @tel_bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def _clone(event):
         file_name = ''
@@ -322,7 +326,7 @@ def _register(tel_bot, pyro_bot, bot_index: int):
             if acc is None and 't.me/c/' in link:
                 await edit.edit(
                     "❌ No session available to access restricted content.\n"
-                    "Use /login to log in with the main bot."
+                    "Use /login on the main bot to log in."
                 )
                 return
 
@@ -358,10 +362,7 @@ def _register(tel_bot, pyro_bot, bot_index: int):
                 await edit.delete()
             except Exception as e:
                 logger.info(e)
-                await tel_bot.send_message(
-                    event.sender_id,
-                    f"Error: {str(e)}"
-                )
+                await tel_bot.send_message(event.sender_id, f"Error: {str(e)}")
                 await edit.delete()
             finally:
                 if tmp_client:
@@ -373,7 +374,7 @@ def _register(tel_bot, pyro_bot, bot_index: int):
             time.sleep(1)
 
 
-# ── Register handlers on every configured extra bot ───────────────────────────
+# ── Register on every configured extra bot ────────────────────────────────────
 
 if extra_clients:
     for _i, (_tel, _pyro) in enumerate(extra_clients, start=2):
@@ -381,4 +382,3 @@ if extra_clients:
     print(f"[multi_bot] Registered handlers on {len(extra_clients)} extra bot(s).")
 else:
     print("[multi_bot] No extra bots configured (BOT_TOKEN2/3/4 not set).")
-
