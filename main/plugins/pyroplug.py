@@ -279,58 +279,135 @@ def _safe_remove(path):
         logger.warning(f"Could not remove '{path}': {e}")
 
 
+def _msg_is_video(msg):
+    """
+    Return True if the Telegram message should be treated as a streamable video.
+
+    Checks the Pyrogram message object directly — this is reliable even when
+    a video was sent as a Document (common in restricted channels), in which
+    case msg.video is None but msg.document.mime_type starts with 'video/'.
+    Extension-based detection is only used as a last-resort fallback.
+    """
+    VIDEO_EXTS = {'.mkv', '.mp4', '.webm', '.mpe4', '.mpeg', '.ts', '.avi', '.flv', '.org'}
+
+    if msg.video or msg.animation:
+        return True
+
+    if msg.document and msg.document.mime_type:
+        if msg.document.mime_type.startswith('video/'):
+            return True
+
+    # Fallback: check the document's stored filename extension
+    if msg.document and msg.document.file_name:
+        ext = os.path.splitext(msg.document.file_name)[1].lower()
+        if ext in VIDEO_EXTS:
+            return True
+
+    return False
+
+
+def _msg_is_photo(msg):
+    """Return True if the message is a photo or image document."""
+    PHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+    if msg.photo:
+        return True
+    if msg.document and msg.document.mime_type:
+        if msg.document.mime_type.startswith('image/'):
+            return True
+    if msg.document and msg.document.file_name:
+        ext = os.path.splitext(msg.document.file_name)[1].lower()
+        if ext in PHOTO_EXTS:
+            return True
+    return False
+
+
 async def _process_and_upload(userbot, client, sender, edit_id, msg, file_str, file_n, upm):
     """
     Handle format conversion, renaming, thumbnail, and upload for a downloaded file.
     file_str must be an absolute path str of an existing file.
     Cleans up the file afterwards.
+
+    Upload type is determined by the *Telegram message object* first (reliable),
+    with the local file extension used only as a fallback.  This is critical
+    because restricted channels often deliver videos as Documents, causing the
+    unique-prefix download path to have no recognised extension.
     """
-    VIDEO_EXTS = {'.mkv', '.mp4', '.webm', '.mpe4', '.mpeg', '.ts', '.avi', '.flv', '.org'}
     CONVERT_EXTS = {'.webm', '.mkv', '.mpe4', '.mpeg', '.ts', '.avi', '.flv', '.org'}
-    PHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 
-    ext = _safe_ext(file_str)
     path = file_str  # current working path — updated on each rename
+    ext  = _safe_ext(file_str)
 
-    caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
+    caption = (
+        f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
+        if msg.caption
+        else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
+    )
+
+    is_video = _msg_is_video(msg)
+    is_photo = _msg_is_photo(msg) and not is_video
+
+    # If extension-only fallback is needed (msg type check inconclusive)
+    if not is_video and not is_photo:
+        VIDEO_EXTS = {'.mkv', '.mp4', '.webm', '.mpe4', '.mpeg', '.ts', '.avi', '.flv', '.org'}
+        PHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+        if ext in VIDEO_EXTS:
+            is_video = True
+        elif ext in PHOTO_EXTS:
+            is_photo = True
 
     try:
-        if ext in VIDEO_EXTS:
-            # ── Step 1: convert non-mp4 container to mp4 ─────────────────────
+        if is_video:
+            # ── Step 1: ensure file has a .mp4 extension ──────────────────────
+            # When downloaded via a prefix (no extension), the file may have no
+            # extension at all, or an unexpected one.  Normalise to .mp4 first.
+            if ext not in {'.mp4'} | CONVERT_EXTS:
+                # No recognised video extension → rename to .mp4
+                new_path = file_str + ".mp4"
+                path = _safe_rename(path, new_path)
+                ext = '.mp4'
+
+            # ── Step 2: convert non-mp4 container to mp4 ─────────────────────
             if ext in CONVERT_EXTS:
                 new_path = _safe_stem(path) + ".mp4"
                 path = _safe_rename(path, new_path)
                 if not os.path.exists(path):
-                    await client.send_message(sender, f"⚠️ Format conversion rename failed for `{os.path.basename(path)}`, skipping.")
+                    await client.send_message(
+                        sender,
+                        f"⚠️ Format conversion rename failed for `{os.path.basename(path)}`, skipping."
+                    )
                     return
 
-            # ── Step 2: apply custom filename if provided ─────────────────────
+            # ── Step 3: apply custom filename if provided ─────────────────────
             if file_n:
-                final_ext = _safe_ext(path)
-                target, need_rename = _build_upload_path(path, file_n, final_ext)
+                target, need_rename = _build_upload_path(path, file_n, _safe_ext(path))
                 if need_rename:
                     path = _safe_rename(path, target)
                     if not os.path.exists(path):
-                        await client.send_message(sender, f"⚠️ Rename to custom filename failed for `{file_n}`, skipping.")
+                        await client.send_message(
+                            sender,
+                            f"⚠️ Rename to custom filename failed for `{file_n}`, skipping."
+                        )
                         return
 
-            # ── Step 3: gather video metadata ─────────────────────────────────
+            # ── Step 4: gather video metadata ─────────────────────────────────
             try:
                 data = video_metadata(path)
                 duration = data["duration"]
-                wi = data["width"]
-                hi = data["height"]
+                wi       = data["width"]
+                hi       = data["height"]
             except Exception as e:
                 logger.warning(f"video_metadata failed for '{path}': {e}")
                 duration, wi, hi = 0, 0, 0
 
-            # ── Step 4: thumbnail ─────────────────────────────────────────────
+            # ── Step 5: thumbnail ─────────────────────────────────────────────
             thumb_path = await _get_thumb(userbot, msg, sender, path, duration)
 
-            # ── Step 5: upload ────────────────────────────────────────────────
-            await send_video_with_chat_id(client, sender, path, caption, duration, hi, wi, thumb_path, upm)
+            # ── Step 6: upload as streamable video ────────────────────────────
+            await send_video_with_chat_id(
+                client, sender, path, caption, duration, hi, wi, thumb_path, upm
+            )
 
-        elif ext in PHOTO_EXTS:
+        elif is_photo:
             if file_n:
                 target, need_rename = _build_upload_path(path, file_n, ext)
                 if need_rename:
@@ -349,7 +426,6 @@ async def _process_and_upload(userbot, client, sender, edit_id, msg, file_str, f
             await send_document_with_chat_id(client, sender, path, caption, thumb_path, upm)
 
     finally:
-        # Clean up the working file (could differ from original file_str after renames)
         _safe_remove(path)
         if path != file_str:
             _safe_remove(file_str)
