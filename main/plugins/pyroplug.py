@@ -35,7 +35,7 @@ def _resolve_dl(file):
 
     Pyrogram writes to a .temp file first and renames on success, but can
     return the .temp path even after the rename completed.  This helper
-    returns the real final path, or None when neither file exists.
+    returns the real final path as a plain str, or None when the file is gone.
     """
     if not file:
         return None
@@ -44,9 +44,27 @@ def _resolve_dl(file):
         final = s[:-5]          # strip trailing .temp
         if os.path.exists(final):
             return final        # rename already happened — use final path
-        if not os.path.exists(s):
-            return None         # .temp also gone — treat as failed download
-    return file
+        if os.path.exists(s):
+            return s            # still in .temp state (very brief window)
+        return None             # both gone — download failed
+    if not os.path.exists(s):
+        return None
+    return s                    # always return plain str
+
+
+def _safe_ext(filepath):
+    """Return the file extension including dot, e.g. '.mp4'.
+    Falls back to '' if no extension found.
+    Uses os.path.splitext which correctly handles dots in directory names.
+    """
+    return os.path.splitext(str(filepath))[1].lower()
+
+
+def _safe_stem(filepath):
+    """Return the file path without its final extension.
+    Uses os.path.splitext which correctly handles dots in filenames.
+    """
+    return os.path.splitext(str(filepath))[0]
 
 
 async def _get_thumb(acc, msg, sender, file, duration):
@@ -57,21 +75,19 @@ async def _get_thumb(acc, msg, sender, file, duration):
       3. Screenshot generated from the video file via FFmpeg
       4. None  (Telegram will show a black/blank frame — last resort)
     """
-    # 1. Custom user thumbnail set via the bot
     if os.path.exists(f'{sender}.jpg'):
         return f'{sender}.jpg'
 
-    # 2. Download the thumbnail that was embedded in the original message
     try:
         media = msg.video or msg.document or msg.animation
         if media and getattr(media, 'thumbs', None):
-            t = await acc.download_media(media.thumbs[-1])
-            if t and os.path.exists(str(t)):
-                return str(t)
+            t = await acc.download_media(media.thumbs[-1], file_name=DOWNLOADS_DIR + "/")
+            t = _resolve_dl(t)
+            if t and os.path.exists(t):
+                return t
     except Exception:
         pass
 
-    # 3. Generate a screenshot from the local video file
     try:
         t = await screenshot(file, duration, sender)
         if t and os.path.exists(str(t)):
@@ -111,10 +127,24 @@ async def set_chat_id(event):
 
 async def send_video_with_chat_id(client, sender, path, caption, duration, hi, wi, thumb_path, upm):
     chat_id = user_chat_ids.get(sender, sender)
+    path_str = str(path)
+
+    # Pre-flight check: make absolutely sure file exists before attempting upload
+    if not os.path.exists(path_str) or os.path.getsize(path_str) == 0:
+        logger.error(f"send_video_with_chat_id: file missing or empty at '{path_str}'")
+        await client.send_message(
+            sender,
+            f"⚠️ Upload skipped — file was not found after download.\n"
+            f"Path: `{path_str}`\n"
+            "This can happen if a concurrent batch renamed or deleted the file. "
+            "Please retry the message."
+        )
+        return
+
     try:
         await client.send_video(
             chat_id=chat_id,
-            video=path,
+            video=path_str,
             caption=caption,
             supports_streaming=True,
             duration=duration,
@@ -137,10 +167,20 @@ async def send_video_with_chat_id(client, sender, path, caption, duration, hi, w
 
 async def send_document_with_chat_id(client, sender, path, caption, thumb_path, upm):
     chat_id = user_chat_ids.get(sender, sender)
+    path_str = str(path)
+
+    if not os.path.exists(path_str) or os.path.getsize(path_str) == 0:
+        logger.error(f"send_document_with_chat_id: file missing or empty at '{path_str}'")
+        await client.send_message(
+            sender,
+            f"⚠️ Upload skipped — file was not found after download.\nPath: `{path_str}`"
+        )
+        return
+
     try:
         await client.send_document(
             chat_id=chat_id,
-            document=path,
+            document=path_str,
             caption=caption,
             thumb=thumb_path,
             progress=progress_for_pyrogram,
@@ -187,6 +227,120 @@ async def check(userbot, client, link):
             logging.info(e)
             return False, "Maybe bot is banned from the chat, or your link is invalid!"
 
+
+def _build_upload_path(file_str, file_n, ext):
+    """
+    Build the final upload path.
+    - If file_n is provided and has an extension, use it as-is under DOWNLOADS_DIR.
+    - If file_n is provided without an extension, append ext.
+    - If file_n is empty, keep the current file path.
+    Returns (new_path_str_or_None, rename_needed).
+    """
+    if not file_n:
+        return file_str, False
+    if '.' in os.path.basename(file_n):
+        new_path = os.path.join(DOWNLOADS_DIR, file_n)
+    else:
+        new_path = os.path.join(DOWNLOADS_DIR, file_n + ext)
+    return new_path, True
+
+
+def _safe_rename(src, dst):
+    """Rename src to dst. Returns dst on success, src on failure."""
+    try:
+        if src != dst:
+            os.rename(src, dst)
+        return dst
+    except Exception as e:
+        logger.error(f"os.rename({src!r} → {dst!r}) failed: {e}")
+        return src
+
+
+def _safe_remove(path):
+    """Delete a file silently."""
+    try:
+        if path and os.path.exists(str(path)):
+            os.remove(str(path))
+    except Exception as e:
+        logger.warning(f"Could not remove '{path}': {e}")
+
+
+async def _process_and_upload(userbot, client, sender, edit_id, msg, file_str, file_n, upm):
+    """
+    Handle format conversion, renaming, thumbnail, and upload for a downloaded file.
+    file_str must be an absolute path str of an existing file.
+    Cleans up the file afterwards.
+    """
+    VIDEO_EXTS = {'.mkv', '.mp4', '.webm', '.mpe4', '.mpeg', '.ts', '.avi', '.flv', '.org'}
+    CONVERT_EXTS = {'.webm', '.mkv', '.mpe4', '.mpeg', '.ts', '.avi', '.flv', '.org'}
+    PHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+
+    ext = _safe_ext(file_str)
+    path = file_str  # current working path — updated on each rename
+
+    caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
+
+    try:
+        if ext in VIDEO_EXTS:
+            # ── Step 1: convert non-mp4 container to mp4 ─────────────────────
+            if ext in CONVERT_EXTS:
+                new_path = _safe_stem(path) + ".mp4"
+                path = _safe_rename(path, new_path)
+                if not os.path.exists(path):
+                    await client.send_message(sender, f"⚠️ Format conversion rename failed for `{os.path.basename(path)}`, skipping.")
+                    return
+
+            # ── Step 2: apply custom filename if provided ─────────────────────
+            if file_n:
+                final_ext = _safe_ext(path)
+                target, need_rename = _build_upload_path(path, file_n, final_ext)
+                if need_rename:
+                    path = _safe_rename(path, target)
+                    if not os.path.exists(path):
+                        await client.send_message(sender, f"⚠️ Rename to custom filename failed for `{file_n}`, skipping.")
+                        return
+
+            # ── Step 3: gather video metadata ─────────────────────────────────
+            try:
+                data = video_metadata(path)
+                duration = data["duration"]
+                wi = data["width"]
+                hi = data["height"]
+            except Exception as e:
+                logger.warning(f"video_metadata failed for '{path}': {e}")
+                duration, wi, hi = 0, 0, 0
+
+            # ── Step 4: thumbnail ─────────────────────────────────────────────
+            thumb_path = await _get_thumb(userbot, msg, sender, path, duration)
+
+            # ── Step 5: upload ────────────────────────────────────────────────
+            await send_video_with_chat_id(client, sender, path, caption, duration, hi, wi, thumb_path, upm)
+
+        elif ext in PHOTO_EXTS:
+            if file_n:
+                target, need_rename = _build_upload_path(path, file_n, ext)
+                if need_rename:
+                    path = _safe_rename(path, target)
+
+            await upm.edit("__Uploading photo...__")
+            await bot.send_file(sender, path, caption=caption)
+
+        else:
+            if file_n:
+                target, need_rename = _build_upload_path(path, file_n, ext)
+                if need_rename:
+                    path = _safe_rename(path, target)
+
+            thumb_path = thumbnail(sender)
+            await send_document_with_chat_id(client, sender, path, caption, thumb_path, upm)
+
+    finally:
+        # Clean up the working file (could differ from original file_str after renames)
+        _safe_remove(path)
+        if path != file_str:
+            _safe_remove(file_str)
+
+
 async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
     edit = ""
     chat = ""
@@ -205,7 +359,6 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
             chat = int('-100' + str(msg_link.split("/")[-2]))
         else:
             chat = int(msg_link.split("/")[-2])
-        file = ""
         try:
             msg = await userbot.get_messages(chat_id=chat, message_ids=msg_id)
             logging.info(msg)
@@ -237,9 +390,12 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
 
             if msg.media:
                 edit = await client.edit_message_text(sender, edit_id, "Trying to Download.")
+                raw_file = None
+                upm = None
                 try:
                     raw_file = await userbot.download_media(
                         msg,
+                        file_name=DOWNLOADS_DIR + "/",
                         progress=progress_for_pyrogram,
                         progress_args=(
                             client,
@@ -249,75 +405,34 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
                         )
                     )
 
-                    file = _resolve_dl(raw_file)
-                    if not file or not os.path.exists(str(file)) or os.path.getsize(str(file)) == 0:
+                    file_str = _resolve_dl(raw_file)
+                    if not file_str or not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
+                        logger.error(f"get_msg: download empty/missing. raw_file={raw_file!r} resolved={file_str!r}")
                         await client.edit_message_text(sender, edit_id, "⚠️ Download failed or file is empty, skipping.")
                         return None
 
-                    path = file
                     await edit.delete()
                     upm = await client.send_message(sender, '__Preparing to Upload!__')
 
-                    caption = str(file)
-                    if msg.caption is not None:
-                        caption = msg.caption
+                    await _process_and_upload(userbot, client, sender, edit_id, msg, file_str, file_n, upm)
 
-                    if str(file).split(".")[-1] in ['mkv', 'mp4', 'webm', 'mpe4', 'mpeg', 'ts', 'avi', 'flv', 'org']:
-                        if str(file).split(".")[-1] in ['webm', 'mkv', 'mpe4', 'mpeg', 'ts', 'avi', 'flv', 'org']:
-                            path = str(file).split(".")[0] + ".mp4"
-                            os.rename(file, path)
-                            file = path
-                        data = video_metadata(file)
-                        duration = data["duration"]
-                        wi = data["width"]
-                        hi = data["height"]
-                        logging.info(data)
-
-                        if file_n != '':
-                            if '.' in file_n:
-                                path = os.path.join(DOWNLOADS_DIR, file_n)
-                            else:
-                                path = os.path.join(DOWNLOADS_DIR, file_n + '.' + str(file).split(".")[-1])
-                            os.rename(file, path)
-                            file = path
-
-                        thumb_path = await _get_thumb(userbot, msg, sender, file, duration)
-
-                        caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
-                        await send_video_with_chat_id(client, sender, path, caption, duration, hi, wi, thumb_path, upm)
-
-                    elif str(file).split(".")[-1] in ['jpg', 'jpeg', 'png', 'webp']:
-                        if file_n != '':
-                            if '.' in file_n:
-                                path = os.path.join(DOWNLOADS_DIR, file_n)
-                            else:
-                                path = os.path.join(DOWNLOADS_DIR, file_n + '.' + str(file).split(".")[-1])
-                            os.rename(file, path)
-                            file = path
-                        caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
-                        await upm.edit("__Uploading photo...__")
-                        await bot.send_file(sender, path, caption=caption)
-
-                    else:
-                        if file_n != '':
-                            if '.' in file_n:
-                                path = os.path.join(DOWNLOADS_DIR, file_n)
-                            else:
-                                path = os.path.join(DOWNLOADS_DIR, file_n + '.' + str(file).split(".")[-1])
-                            os.rename(file, path)
-                            file = path
-                        thumb_path = "thumb.jpg"
-                        caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
-                        await send_document_with_chat_id(client, sender, path, caption, thumb_path, upm)
-
-                    if os.path.exists(str(file)):
-                        os.remove(str(file))
                     await upm.delete()
                     return None
                 except Exception as e:
-                    logging.error(f"Error downloading media: {str(e)}")
-                    await client.edit_message_text(sender, edit_id, f"Could not download media: {str(e)[:100]}")
+                    logger.error(f"get_msg: error for msg {msg_id}: {e}", exc_info=True)
+                    try:
+                        await client.edit_message_text(sender, edit_id, f"Could not download media: {str(e)[:200]}")
+                    except Exception:
+                        pass
+                    if raw_file:
+                        _safe_remove(_resolve_dl(raw_file))
                     return None
+                finally:
+                    if upm:
+                        try:
+                            await upm.delete()
+                        except Exception:
+                            pass
         except (ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid):
             await client.edit_message_text(sender, edit_id, "Bot is not in that channel/group.\nSend the invite link so the bot can join.")
             return None
@@ -348,7 +463,6 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
             chat = int('-100' + str(parts[4]))
         else:
             chat = int(msg_link.split("/")[-2])
-        file = ""
         try:
             msg = await userbot.get_messages(chat_id=chat, message_ids=msg_id)
             logging.info(msg)
@@ -380,9 +494,12 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
 
             if msg.media:
                 edit = await client.edit_message_text(sender, edit_id, "Trying to Download.")
+                raw_file = None
+                upm = None
                 try:
                     raw_file = await userbot.download_media(
                         msg,
+                        file_name=DOWNLOADS_DIR + "/",
                         progress=progress_for_pyrogram,
                         progress_args=(
                             client,
@@ -392,75 +509,34 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
                         )
                     )
 
-                    file = _resolve_dl(raw_file)
-                    if not file or not os.path.exists(str(file)) or os.path.getsize(str(file)) == 0:
+                    file_str = _resolve_dl(raw_file)
+                    if not file_str or not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
+                        logger.error(f"ggn_new: download empty/missing. raw_file={raw_file!r} resolved={file_str!r}")
                         await client.edit_message_text(sender, edit_id, "⚠️ Download failed or file is empty, skipping.")
                         return None
 
-                    path = file
                     await edit.delete()
                     upm = await client.send_message(sender, '__Preparing to Upload!__')
 
-                    caption = str(file)
-                    if msg.caption is not None:
-                        caption = msg.caption
+                    await _process_and_upload(userbot, client, sender, edit_id, msg, file_str, file_n, upm)
 
-                    if str(file).split(".")[-1] in ['mkv', 'mp4', 'webm', 'mpe4', 'mpeg', 'ts', 'avi', 'flv', 'org']:
-                        if str(file).split(".")[-1] in ['webm', 'mkv', 'mpe4', 'mpeg', 'ts', 'avi', 'flv', 'org']:
-                            path = str(file).split(".")[0] + ".mp4"
-                            os.rename(file, path)
-                            file = path
-                        data = video_metadata(file)
-                        duration = data["duration"]
-                        wi = data["width"]
-                        hi = data["height"]
-                        logging.info(data)
-
-                        if file_n != '':
-                            if '.' in file_n:
-                                path = os.path.join(DOWNLOADS_DIR, file_n)
-                            else:
-                                path = os.path.join(DOWNLOADS_DIR, file_n + '.' + str(file).split(".")[-1])
-                            os.rename(file, path)
-                            file = path
-
-                        thumb_path = await _get_thumb(userbot, msg, sender, file, duration)
-
-                        caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
-                        await send_video_with_chat_id(client, sender, path, caption, duration, hi, wi, thumb_path, upm)
-
-                    elif str(file).split(".")[-1] in ['jpg', 'jpeg', 'png', 'webp']:
-                        if file_n != '':
-                            if '.' in file_n:
-                                path = os.path.join(DOWNLOADS_DIR, file_n)
-                            else:
-                                path = os.path.join(DOWNLOADS_DIR, file_n + '.' + str(file).split(".")[-1])
-                            os.rename(file, path)
-                            file = path
-                        caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
-                        await upm.edit("__Uploading photo...__")
-                        await bot.send_file(sender, path, caption=caption)
-
-                    else:
-                        if file_n != '':
-                            if '.' in file_n:
-                                path = os.path.join(DOWNLOADS_DIR, file_n)
-                            else:
-                                path = os.path.join(DOWNLOADS_DIR, file_n + '.' + str(file).split(".")[-1])
-                            os.rename(file, path)
-                            file = path
-                        thumb_path = "thumb.jpg"
-                        caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
-                        await send_document_with_chat_id(client, sender, path, caption, thumb_path, upm)
-
-                    if os.path.exists(str(file)):
-                        os.remove(str(file))
                     await upm.delete()
                     return None
                 except Exception as e:
-                    logging.error(f"Error downloading media: {str(e)}")
-                    await client.edit_message_text(sender, edit_id, f"Could not download media: {str(e)[:100]}")
+                    logger.error(f"ggn_new: error for msg {msg_id}: {e}", exc_info=True)
+                    try:
+                        await client.edit_message_text(sender, edit_id, f"Could not download media: {str(e)[:200]}")
+                    except Exception:
+                        pass
+                    if raw_file:
+                        _safe_remove(_resolve_dl(raw_file))
                     return None
+                finally:
+                    if upm:
+                        try:
+                            await upm.delete()
+                        except Exception:
+                            pass
         except (ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid):
             await client.edit_message_text(sender, edit_id, "Bot is not in that channel/group.\nSend the invite link so the bot can join.")
             return None
