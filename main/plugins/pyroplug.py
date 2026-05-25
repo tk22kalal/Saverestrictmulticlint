@@ -1,11 +1,25 @@
 # Join t.me/dev_gagan
 
-import asyncio, time, os
+import asyncio, time, os, uuid
 
 from pyrogram.enums import ParseMode, MessageMediaType
 
 DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+
+def _unique_dl_prefix(sender, msg_id):
+    """
+    Return a unique file path PREFIX (no extension) inside DOWNLOADS_DIR.
+
+    Pyrogram appends the correct extension (e.g. .mp4) automatically when
+    no extension is present in file_name.  Using a unique prefix per
+    download ensures no two concurrent bots or batches ever share the same
+    .temp filename, which is the root cause of [Errno 2] collisions.
+    """
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)   # re-ensure dir exists at call time
+    short_id = uuid.uuid4().hex[:12]
+    return os.path.join(DOWNLOADS_DIR, f"dl_{sender}_{msg_id}_{short_id}")
 
 from .. import Bot, bot
 from main.plugins.progress import progress_for_pyrogram
@@ -81,7 +95,7 @@ async def _get_thumb(acc, msg, sender, file, duration):
     try:
         media = msg.video or msg.document or msg.animation
         if media and getattr(media, 'thumbs', None):
-            t = await acc.download_media(media.thumbs[-1], file_name=DOWNLOADS_DIR + "/")
+            t = await acc.download_media(media.thumbs[-1], file_name=_unique_dl_prefix(sender, "thumb"))
             t = _resolve_dl(t)
             if t and os.path.exists(t):
                 return t
@@ -395,7 +409,7 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
                 try:
                     raw_file = await userbot.download_media(
                         msg,
-                        file_name=DOWNLOADS_DIR + "/",
+                        file_name=_unique_dl_prefix(sender, msg_id),
                         progress=progress_for_pyrogram,
                         progress_args=(
                             client,
@@ -499,7 +513,7 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
                 try:
                     raw_file = await userbot.download_media(
                         msg,
-                        file_name=DOWNLOADS_DIR + "/",
+                        file_name=_unique_dl_prefix(sender, msg_id),
                         progress=progress_for_pyrogram,
                         progress_args=(
                             client,
