@@ -30,6 +30,25 @@ def thumbnail(sender):
     return f'{sender}.jpg' if os.path.exists(f'{sender}.jpg') else f'thumb.jpg'
 
 
+def _resolve_dl(file):
+    """Normalize the path returned by Pyrogram's download_media.
+
+    Pyrogram writes to a .temp file first and renames on success, but can
+    return the .temp path even after the rename completed.  This helper
+    returns the real final path, or None when neither file exists.
+    """
+    if not file:
+        return None
+    s = str(file)
+    if s.endswith('.temp'):
+        final = s[:-5]          # strip trailing .temp
+        if os.path.exists(final):
+            return final        # rename already happened — use final path
+        if not os.path.exists(s):
+            return None         # .temp also gone — treat as failed download
+    return file
+
+
 async def _get_thumb(acc, msg, sender, file, duration):
     """
     Return a thumbnail path, tried in priority order:
@@ -219,7 +238,7 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
             if msg.media:
                 edit = await client.edit_message_text(sender, edit_id, "Trying to Download.")
                 try:
-                    file = await userbot.download_media(
+                    raw_file = await userbot.download_media(
                         msg,
                         progress=progress_for_pyrogram,
                         progress_args=(
@@ -230,6 +249,7 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
                         )
                     )
 
+                    file = _resolve_dl(raw_file)
                     if not file or not os.path.exists(str(file)) or os.path.getsize(str(file)) == 0:
                         await client.edit_message_text(sender, edit_id, "⚠️ Download failed or file is empty, skipping.")
                         return None
@@ -246,7 +266,7 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
                         if str(file).split(".")[-1] in ['webm', 'mkv', 'mpe4', 'mpeg', 'ts', 'avi', 'flv', 'org']:
                             path = str(file).split(".")[0] + ".mp4"
                             os.rename(file, path)
-                            file = str(file).split(".")[0] + ".mp4"
+                            file = path
                         data = video_metadata(file)
                         duration = data["duration"]
                         wi = data["width"]
@@ -290,8 +310,8 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
                         caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
                         await send_document_with_chat_id(client, sender, path, caption, thumb_path, upm)
 
-                    if os.path.exists(file):
-                        os.remove(file)
+                    if os.path.exists(str(file)):
+                        os.remove(str(file))
                     await upm.delete()
                     return None
                 except Exception as e:
@@ -361,7 +381,7 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
             if msg.media:
                 edit = await client.edit_message_text(sender, edit_id, "Trying to Download.")
                 try:
-                    file = await userbot.download_media(
+                    raw_file = await userbot.download_media(
                         msg,
                         progress=progress_for_pyrogram,
                         progress_args=(
@@ -372,6 +392,7 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
                         )
                     )
 
+                    file = _resolve_dl(raw_file)
                     if not file or not os.path.exists(str(file)) or os.path.getsize(str(file)) == 0:
                         await client.edit_message_text(sender, edit_id, "⚠️ Download failed or file is empty, skipping.")
                         return None
@@ -388,7 +409,7 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
                         if str(file).split(".")[-1] in ['webm', 'mkv', 'mpe4', 'mpeg', 'ts', 'avi', 'flv', 'org']:
                             path = str(file).split(".")[0] + ".mp4"
                             os.rename(file, path)
-                            file = str(file).split(".")[0] + ".mp4"
+                            file = path
                         data = video_metadata(file)
                         duration = data["duration"]
                         wi = data["width"]
@@ -432,8 +453,8 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
                         caption = f"{msg.caption}\n\n__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__" if msg.caption else "__Unrestricted by **[Team SPY](https://t.me/dev_gagan)**__"
                         await send_document_with_chat_id(client, sender, path, caption, thumb_path, upm)
 
-                    if os.path.exists(file):
-                        os.remove(file)
+                    if os.path.exists(str(file)):
+                        os.remove(str(file))
                     await upm.delete()
                     return None
                 except Exception as e:
