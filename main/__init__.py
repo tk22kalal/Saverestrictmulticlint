@@ -18,7 +18,7 @@ API_ID    = int(os.environ.get("API_ID",    "24058425"))
 API_HASH  = os.environ.get("API_HASH",      "694b063e55c24287a3d30aed90191373")
 BOT_TOKEN = os.environ.get("BOT_TOKEN",     "8600580531:AAFnpo9I-3e2PH9NnpfEy0KG3i8_zJMLR90")
 SESSION   = os.environ.get("SESSION",       "").strip()
-FORCESUB  = os.environ.get("FORCESUB",      "forcesubpavo3")
+FORCESUB  = os.environ.get("FORCESUB",      "forsesubpavo3")
 AUTH      = os.environ.get("AUTH",          "7390527029")
 
 # ── Optional extra bot tokens (BOT_TOKEN2, BOT_TOKEN3, BOT_TOKEN4) ───────────
