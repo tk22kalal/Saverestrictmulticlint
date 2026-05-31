@@ -1,40 +1,34 @@
 """
-fbatch.py — /fbatch: Forum Batch Topic Scanner
-
-Flow (mirrors /batch UX):
-  1. User sends /fbatch
-  2. Bot asks for the start–end link range
-  3. Bot scans every message ID in that range in batches of 100
-  4. Groups messages by forum topic, finds first & last msg per topic
-  5. Sends a .txt file with all active topics and their link ranges
+fbatch.py — /fbatch: Forum Batch Topic Scanner (pure Pyrogram)
 """
 
 import asyncio
 import logging
 import os
 import tempfile
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
+from pyrogram.errors import FloodWait
 
-from pyrogram import Client
-from telethon import events, Button
+# These are assumed to be already defined in your project
+# from .. import bot as app, userbot, API_ID, API_HASH
+# from main.plugins.batch import _parse_range, _get_user_session
 
-from .. import bot as gagan, userbot, Bot, API_ID, API_HASH
-from main.plugins.batch import _parse_range, _get_user_session
+# Replace with your actual app / session setup
+app = Client(...)          # your main bot client
+userbot = None             # optional user account, if you have one
 
-logger = logging.getLogger(__name__)
-
-_CHUNK     = 100    # IDs per get_messages() call
-_DELAY     = 0.35   # seconds between chunks (flood-safe)
-_NAME_DELAY= 0.2    # seconds between topic-name fetches
+_CHUNK      = 100
+_DELAY      = 0.35
+_NAME_DELAY = 0.2
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _raw_chat(chat_ref) -> str:
-    """Convert -1002932205861 → '2932205861' for URL building."""
     if isinstance(chat_ref, int):
         return str(abs(chat_ref))[3:]
     return str(chat_ref)
-
 
 def _msg_url(chat_ref, topic_id: int, msg_id: int) -> str:
     rc = _raw_chat(chat_ref)
@@ -42,67 +36,54 @@ def _msg_url(chat_ref, topic_id: int, msg_id: int) -> str:
         return f"https://t.me/c/{rc}/{topic_id}/{msg_id}"
     return f"https://t.me/{rc}/{topic_id}/{msg_id}"
 
-
 def _topic_url(chat_ref, topic_id: int) -> str:
     rc = _raw_chat(chat_ref)
     if isinstance(chat_ref, int):
         return f"https://t.me/c/{rc}/{topic_id}"
     return f"https://t.me/{rc}/{topic_id}"
 
-
-def _get_topic_id(msg) -> "int | None":
+def _get_topic_id(msg: Message) -> "int | None":
     """
-    Extract the forum-topic ID from a Pyrogram Message.
-    Tries every known attribute path across pyrogram / pyrofork builds.
+    Extract forum-topic ID from a Pyrogram Message.
+    Handles different Pyrogram / Pyrofork builds.
     """
-    # 1. Message IS the topic header (service message)
-    if getattr(msg, "forum_topic_created", None) is not None:
+    # 1. Service message that created the topic
+    if msg.forum_topic_created is not None:
         return msg.id
 
-    # 2. Standard pyrogram / pyrofork field
-    tid = getattr(msg, "reply_to_top_message_id", None)
-    if tid:
-        return int(tid)
+    # 2. Standard field
+    if msg.reply_to_top_message_id:
+        return msg.reply_to_top_message_id
 
-    # 3. Alternate alias
-    tid = getattr(msg, "message_thread_id", None)
-    if tid:
-        return int(tid)
+    # 3. Alternative field
+    if msg.message_thread_id:
+        return msg.message_thread_id
 
-    # 4. Dig into pyrogram internals — raw reply_to header
-    raw = getattr(msg, "_raw", None)
-    if raw is None:
-        # pyrofork stores raw as ._wrapped or directly on the object
-        raw = msg
-    reply_to = getattr(raw, "reply_to", None)
-    if reply_to:
-        tid = getattr(reply_to, "reply_to_top_id", None)
-        if tid:
-            return int(tid)
-        # direct reply to topic root (depth-1 messages use reply_to_msg_id)
-        tid = getattr(reply_to, "reply_to_msg_id", None)
-        if tid:
-            return int(tid)
+    # 4. Fallback: raw reply_to header
+    try:
+        raw = msg._raw  # may not exist in all builds
+        if raw and raw.reply_to:
+            if raw.reply_to.reply_to_top_id:
+                return raw.reply_to.reply_to_top_id
+            if raw.reply_to.reply_to_msg_id:
+                return raw.reply_to.reply_to_msg_id
+    except Exception:
+        pass
 
     return None
 
 
 # ─── Core scan ────────────────────────────────────────────────────────────────
 
-async def _scan(acc, chat_ref, scan_start: int, scan_end: int,
-                status_msg) -> "dict[int, dict]":
-    """
-    Fetch every message ID in [scan_start, scan_end] in chunks of _CHUNK.
-    Returns { topic_id: {'min': int, 'max': int, 'name': None} }
-    """
-    topics: "dict[int, dict]" = {}
-    total    = scan_end - scan_start + 1
-    done     = 0
-    last_upd = -10   # force first update
+async def _scan(acc: Client, chat_ref: str | int, scan_start: int, scan_end: int,
+                status_msg: Message) -> "dict[int, dict]":
+    topics = {}
+    total = scan_end - scan_start + 1
+    done = 0
+    last_upd = -10
 
     for chunk_start in range(scan_start, scan_end + 1, _CHUNK):
-        ids = list(range(chunk_start,
-                         min(chunk_start + _CHUNK, scan_end + 1)))
+        ids = list(range(chunk_start, min(chunk_start + _CHUNK, scan_end + 1)))
         try:
             result = await acc.get_messages(chat_ref, ids)
             msgs = result if isinstance(result, list) else [result]
@@ -112,7 +93,7 @@ async def _scan(acc, chat_ref, scan_start: int, scan_end: int,
             continue
 
         for msg in msgs:
-            if msg is None or getattr(msg, "empty", True):
+            if msg is None or msg.empty:
                 continue
             tid = _get_topic_id(msg)
             if tid is None:
@@ -143,73 +124,69 @@ async def _scan(acc, chat_ref, scan_start: int, scan_end: int,
     return topics
 
 
-async def _fetch_names(acc, chat_ref, topics: dict) -> None:
-    """Fill topics[tid]['name'] by fetching each topic's header message."""
+async def _fetch_names(acc: Client, chat_ref: str | int, topics: dict) -> None:
     for tid in list(topics.keys()):
         try:
             msg = await acc.get_messages(chat_ref, tid)
-            if msg and not getattr(msg, "empty", True):
-                ftc = getattr(msg, "forum_topic_created", None)
-                if ftc:
-                    topics[tid]["name"] = (
-                        getattr(ftc, "name", None)
-                        or getattr(ftc, "title", None)
-                    )
+            if msg and not msg.empty and msg.forum_topic_created:
+                ftc = msg.forum_topic_created
+                topics[tid]["name"] = ftc.name or ftc.title or None
         except Exception:
             pass
         await asyncio.sleep(_NAME_DELAY)
 
 
-# ─── /fbatch command ──────────────────────────────────────────────────────────
+# ─── /fbatch command (pure Pyrogram) ──────────────────────────────────────────
 
-@gagan.on(events.NewMessage(incoming=True, pattern=r'^/fbatch(?:\s|$|@)'))
-async def fbatch_command(event):
-    uid = event.sender_id
+@app.on_message(filters.command("fbatch") & filters.private)   # or filters.group if needed
+async def fbatch_command(client: Client, message: Message):
+    uid = message.from_user.id
 
-    # ── Step 1: ask for range link ────────────────────────────────────────────
-    raw_range = None
-    async with gagan.conversation(event.chat_id, timeout=120) as conv:
-        try:
-            await conv.send_message(
-                "📋 **Forum Topic Scanner**\n\n"
-                "Send the **start–end link range** to scan:\n\n"
-                "**Format:** `START_LINK-END_LINK`\n\n"
-                "**Example:**\n"
-                "`https://t.me/c/2932205861/116/117"
-                "-https://t.me/c/2932205861/1040/1642`",
-                buttons=Button.force_reply()
-            )
-            reply = await conv.get_reply()
-            raw_range = reply.text.strip() if reply and reply.text else ""
-        except asyncio.TimeoutError:
-            await event.respond("⏳ Timed out. Send /fbatch to try again.")
-            return
-        except Exception as e:
-            logger.warning(f"fbatch conv error: {e}")
-            return
-
-    if not raw_range:
-        await event.respond("❌ No link received. Send /fbatch to try again.")
+    # Step 1: ask for range link
+    try:
+        await message.reply(
+            "📋 **Forum Topic Scanner**\n\n"
+            "Send the **start–end link range** to scan:\n\n"
+            "**Format:** `START_LINK-END_LINK`\n\n"
+            "**Example:**\n"
+            "`https://t.me/c/2932205861/116/117-https://t.me/c/2932205861/1040/1642`",
+            reply_markup=ForceReply(selective=True)
+        )
+        range_msg = await client.ask(
+            message.chat.id,
+            "Send the link range",
+            timeout=120,
+            filters=filters.text
+        )
+        raw_range = range_msg.text.strip()
+    except asyncio.TimeoutError:
+        await message.reply("⏳ Timed out. Send /fbatch to try again.")
+        return
+    except Exception as e:
+        logger.warning(f"fbatch conv error: {e}")
         return
 
-    # ── Step 2: parse ─────────────────────────────────────────────────────────
-    parsed = _parse_range(raw_range)
+    if not raw_range:
+        await message.reply("❌ No link received. Send /fbatch to try again.")
+        return
+
+    # Step 2: parse (use your existing _parse_range)
+    parsed = _parse_range(raw_range)      # assumes it's importable
     if not parsed:
-        await event.respond(
+        await message.reply(
             "❌ Could not parse that link.\n\n"
             "Use the format:\n"
-            "`https://t.me/c/CHATID/TOPIC/MSGID"
-            "-https://t.me/c/CHATID/TOPIC2/MSGID2`"
+            "`https://t.me/c/CHATID/TOPIC/MSGID-https://t.me/c/CHATID/TOPIC2/MSGID2`"
         )
         return
 
     chat_ref, _st, scan_start, _et, scan_end = parsed
 
     if scan_end < scan_start:
-        await event.respond("❌ End message ID must be ≥ start message ID.")
+        await message.reply("❌ End message ID must be ≥ start message ID.")
         return
 
-    # ── Step 3: get user session ──────────────────────────────────────────────
+    # Step 3: get user session (fallback to userbot or personal client)
     acc = userbot
     personal_acc = None
 
@@ -227,20 +204,20 @@ async def fbatch_command(event):
                 await personal_acc.start()
                 acc = personal_acc
             except Exception as e:
-                await event.respond(f"⚠️ Could not start your session: `{e}`")
+                await message.reply(f"⚠️ Could not start your session: `{e}`")
                 return
 
     if acc is None:
-        await event.respond(
+        await message.reply(
             "❌ **No user session available.**\n\n"
             "A Telegram user account is required to read private channels.\n"
             "Use /login to authenticate, then try /fbatch again."
         )
         return
 
-    # ── Step 4: scan ──────────────────────────────────────────────────────────
+    # Step 4: scan
     total_ids = scan_end - scan_start + 1
-    status = await event.respond(
+    status = await message.reply(
         f"🔍 **Forum Topic Scanner** — started\n\n"
         f"Chat : `{chat_ref}`\n"
         f"Range: `{scan_start}` → `{scan_end}` ({total_ids} IDs)\n\n"
@@ -266,7 +243,7 @@ async def fbatch_command(event):
             except Exception: pass
         return
 
-    # ── Step 5: fetch topic names ─────────────────────────────────────────────
+    # Step 5: fetch topic names
     try:
         await status.edit(f"✅ Found **{len(topics)}** topic(s) — fetching names…")
         await _fetch_names(acc, chat_ref, topics)
@@ -277,7 +254,7 @@ async def fbatch_command(event):
             try: await personal_acc.stop()
             except Exception: pass
 
-    # ── Step 6: build .txt output ─────────────────────────────────────────────
+    # Step 6: build .txt output
     lines = []
     lines.append(
         f"Forum Topic Scan Results\n"
@@ -308,23 +285,22 @@ async def fbatch_command(event):
 
     txt_content = "\n".join(lines)
 
-    # ── Step 7: send the file ─────────────────────────────────────────────────
+    # Step 7: send the file
     tmp_path = None
     try:
-        fd, tmp_path = tempfile.mkstemp(suffix=".txt",
-                                        prefix=f"fbatch_{uid}_")
+        fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix=f"fbatch_{uid}_")
         os.close(fd)
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(txt_content)
 
-        caption = (
-            f"✅ **{len(topics)} topics** found in range "
-            f"`{scan_start}` → `{scan_end}`"
+        caption = f"✅ **{len(topics)} topics** found in range `{scan_start}` → `{scan_end}`"
+        await client.send_document(
+            uid, tmp_path,
+            caption=caption
         )
-        await gagan.send_file(uid, tmp_path, caption=caption)
     except Exception as e:
         logger.error(f"fbatch send_file: {e}")
-        await event.respond(f"❌ Could not send result file: `{e}`")
+        await message.reply(f"❌ Could not send result file: `{e}`")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try: os.remove(tmp_path)
