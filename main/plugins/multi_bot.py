@@ -20,14 +20,14 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 from .. import extra_clients, userbot, API_ID, API_HASH
-from main.plugins.batch import _parse_link, _run_batch, temp_log_file
+from main.plugins.batch import _parse_range, _run_batch, temp_log_file
 from main.plugins.helpers import get_link, join
 from main.plugins.pyroplug import ggn_new, user_chat_ids
 
 logger = logging.getLogger(__name__)
 
 _COMMANDS = [
-    '/dl', '/batch', '/cancel', '/login', '/logout', '/mysession',
+    '/dl', '/batch', '/sbatch', '/cancel', '/login', '/logout', '/mysession',
     '/start', '/help', '/logs', '/setchat', '/remthumb', '/ivalid',
 ]
 
@@ -57,19 +57,25 @@ Note: Send a photo (no command) to set a custom thumbnail.
 """ % _REPO_URL
 
 
-def _get_user_session(user_id):
-    path = "user_sessions.json"
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f).get(str(user_id))
-        except Exception:
-            return None
-    return None
+async def _get_user_session(user_id):
+    from main.plugins.session_store import get_user_session as _gs
+    return await _gs(user_id)
 
 
-def _is_range_link(link: str) -> bool:
-    last = link.rstrip("/").split("/")[-1].replace("?single", "")
+def _is_range_link(raw: str) -> bool:
+    """
+    Return True if the text is a batch range — must NOT be processed as a single file.
+
+    Handles two formats:
+      NEW  — two full URLs joined by a hyphen:
+               https://t.me/c/CHAT/TOPIC/143-https://t.me/c/CHAT/TOPIC/144
+      OLD  — single URL whose last segment is START-END:
+               https://t.me/c/CHAT/TOPIC/23-25
+    """
+    if raw.count('https://') >= 2 or raw.count('http://') >= 2:
+        return True
+    clean = raw.strip().rstrip("/").split("?")[0]
+    last = clean.split("/")[-1]
     if "-" in last:
         parts = last.split("-", 1)
         return parts[0].isdigit() and parts[1].isdigit()
@@ -153,65 +159,63 @@ def _register(tel_bot, pyro_bot, bot_index: int):
         await event.respond('Thumbnail saved successfully!')
 
     # /batch ──────────────────────────────────────────────────────────────────
-    @tel_bot.on(events.NewMessage(incoming=True, pattern='/batch'))
+    @tel_bot.on(events.NewMessage(incoming=True, pattern=r'^/batch(?:\s|$|@)'))
     async def _bulk(event):
         uid = event.sender_id
 
-        # Only check THIS bot's dict — no cross-bot blocking
         if _batches.get(uid) is False:
             return await event.reply(
                 "A batch is already running on this bot. Use /cancel to stop it."
             )
 
-        chat_ref = None
-        start_msg = end_msg = 0
+        parsed = None
 
         async with tel_bot.conversation(event.chat_id, timeout=120) as conv:
             try:
                 await conv.send_message(
                     "Send the message link with a **start–end range**.\n\n"
-                    "**Examples:**\n"
-                    "• `https://t.me/c/2133410746/926447-926450` — private channel\n"
-                    "• `https://t.me/c/3765531856/4/23-25` — supergroup topic\n"
-                    "• `https://t.me/username/100-120` — public channel\n\n"
-                    "_For a single file, just send the normal link without a range._",
+                    "**Format — START link, a hyphen, then END link:**\n"
+                    "• `https://t.me/c/2133410746/926447-https://t.me/c/2133410746/926450`\n"
+                    "• `https://t.me/c/3765531856/4/23-https://t.me/c/3765531856/8/270`\n"
+                    "  _(supergroup: topics 4→8)_\n"
+                    "• `https://t.me/username/100-https://t.me/username/125`\n\n"
+                    "**Old compact format also works:**\n"
+                    "• `https://t.me/c/2133410746/926447-926450`\n\n"
+                    "_For a single file, send the normal link without a range._",
                     buttons=Button.force_reply()
                 )
                 link_msg = await conv.get_reply()
 
                 raw = link_msg.text.strip() if link_msg.text else ""
-                _link = get_link(raw) or raw
-
-                if not _link:
-                    await conv.send_message(
-                        "No valid link found. Please try /batch again."
-                    )
+                if not raw:
+                    await conv.send_message("No link received. Please try /batch again.")
                     return
 
-                parsed = _parse_link(_link)
+                parsed = _parse_range(raw)
                 if not parsed:
                     await conv.send_message(
-                        "❌ Could not read a message range from that link.\n"
-                        "Make sure it ends like `…/START-END` (e.g. `…/100-150`)."
+                        "❌ Could not parse a range from that input.\n"
+                        "Use: `START_LINK-END_LINK`"
                     )
                     return
 
-                chat_ref, start_msg, end_msg = parsed
-                total = end_msg - start_msg + 1
+                chat_ref, start_topic, start_msg, end_topic, end_msg = parsed
 
-                if total < 1:
-                    await conv.send_message("End ID must be ≥ start ID.")
-                    return
-                if total > 10000:
-                    await conv.send_message("Max range is 10 000 messages per batch.")
+                if end_msg < start_msg and start_topic == end_topic:
+                    await conv.send_message("End message ID must be ≥ start message ID.")
                     return
 
-                _batches[uid] = False   # mark running in THIS bot's dict
+                _batches[uid] = False
+                if start_topic is not None and start_topic != end_topic:
+                    desc = (f"Topics `{start_topic}` → `{end_topic}`\n"
+                            f"From msg `{start_msg}` … to msg `{end_msg}`")
+                else:
+                    desc = f"Msgs `{start_msg}` → `{end_msg}`"
+
                 await conv.send_message(
                     f"🚀 **Batch starting** (Bot #{bot_index})\n"
                     f"Chat: `{chat_ref}`\n"
-                    f"Range: `{start_msg}` → `{end_msg}` ({total} messages)\n\n"
-                    "Use /cancel to stop."
+                    f"{desc}\n\nUse /cancel to stop."
                 )
 
             except asyncio.TimeoutError:
@@ -222,12 +226,13 @@ def _register(tel_bot, pyro_bot, bot_index: int):
                 await event.respond(f"Error: {e}")
                 return
 
-        # Resolve user account (shared userbot → per-user /login session)
+        chat_ref, start_topic, start_msg, end_topic, end_msg = parsed
+
         acc = userbot
         personal_acc = None
 
         if acc is None:
-            sess = _get_user_session(uid)
+            sess = await _get_user_session(uid)
             if sess:
                 try:
                     personal_acc = Client(
@@ -255,8 +260,8 @@ def _register(tel_bot, pyro_bot, bot_index: int):
             )
 
         try:
-            # Pass THIS bot's _batches so cancellation is isolated per bot
-            await _run_batch(acc, pyro_bot, uid, chat_ref, start_msg, end_msg,
+            await _run_batch(acc, pyro_bot, uid, chat_ref,
+                             start_topic, start_msg, end_topic, end_msg,
                              batches_dict=_batches)
         finally:
             if personal_acc:
@@ -286,14 +291,15 @@ def _register(tel_bot, pyro_bot, bot_index: int):
             return
 
         for line in lines:
+            # Check raw line first — covers both dual-URL and compact range formats
+            if _is_range_link(line):
+                return
+
             try:
                 link = get_link(line)
                 if not link:
                     return
             except TypeError:
-                return
-
-            if _is_range_link(link):
                 return
 
             if "|" in line:
@@ -307,7 +313,7 @@ def _register(tel_bot, pyro_bot, bot_index: int):
             tmp_client = None
 
             if acc is None:
-                sess = _get_user_session(event.sender_id)
+                sess = await _get_user_session(event.sender_id)
                 if sess:
                     try:
                         tmp_client = Client(
